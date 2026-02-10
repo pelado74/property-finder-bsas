@@ -113,4 +113,251 @@ class PropertyMatcher:
         max_score += hab_peso
         if propiedad.get('habitaciones', 0) >= self.criterios['habitaciones']['min']:
             score += hab_peso
-        b​​​​​​​​​​​​​​​​
+        banos_peso = self.criterios['baños']['peso'] * 100
+        max_score += banos_peso
+        if propiedad.get('banos', 0) >= self.criterios['baños']['min']:
+            score += banos_peso
+        m2c_peso = self.criterios['m2_cubiertos']['peso'] * 100
+        max_score += m2c_peso
+        if propiedad.get('m2_cubiertos', 0) >= self.criterios['m2_cubiertos']['min']:
+            score += m2c_peso
+        m2d_peso = self.criterios['m2_descubiertos']['peso'] * 100
+        max_score += m2d_peso
+        if propiedad.get('m2_descubiertos', 0) >= self.criterios['m2_descubiertos']['min']:
+            score += m2d_peso
+        amenities = ' '.join(propiedad.get('amenities', [])).lower()
+        descripcion = propiedad.get('descripcion', '').lower()
+        texto_completo = f"{amenities} {descripcion}"
+        if any(word in texto_completo for word in ['garaje', 'cochera']):
+            score += self.criterios['amenities']['peso_garaje'] * 100
+        max_score += self.criterios['amenities']['peso_garaje'] * 100
+        if any(word in texto_completo for word in ['piscina', 'pileta']):
+            score += self.criterios['amenities']['peso_piscina'] * 100
+        max_score += self.criterios['amenities']['peso_piscina'] * 100
+        if any(word in texto_completo for word in ['jardin', 'jardín', 'parque']):
+            score += self.criterios['amenities']['peso_jardin'] * 100
+        max_score += self.criterios['amenities']['peso_jardin'] * 100
+        match_percentage = (score / max_score * 100) if max_score > 0 else 0
+        return round(match_percentage, 2)
+''')
+    
+    # Notifier.py
+    create_file('notifier.py', '''import requests
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
+class TelegramNotifier:
+    def __init__(self, token=TELEGRAM_BOT_TOKEN, chat_id=TELEGRAM_CHAT_ID):
+        self.token = token
+        self.chat_id = chat_id
+        self.base_url = f"https://api.telegram.org/bot{token}"
+    
+    def send_property_alert(self, propiedad):
+        mensaje = self._format_property_message(propiedad)
+        url = f"{self.base_url}/sendMessage"
+        data = {"chat_id": self.chat_id, "text": mensaje, "parse_mode": "HTML", "disable_web_page_preview": False}
+        try:
+            response = requests.post(url, json=data, timeout=10)
+            return response.status_code == 200
+        except Exception as e:
+            print(f"Error enviando notificación: {e}")
+            return False
+    
+    def _format_property_message(self, prop):
+        match_emoji = "🔥" if prop['match_score'] >= 90 else "✨" if prop['match_score'] >= 80 else "⭐"
+        mensaje = f"""
+{match_emoji} <b>NUEVA PROPIEDAD - {prop['match_score']}% MATCH</b>
+
+🏠 <b>{prop['titulo']}</b>
+
+💰 <b>Precio:</b> {prop['moneda']} {prop['precio']:,.0f}
+📍 <b>Ubicación:</b> {prop['ubicacion']}
+🏷️ <b>Portal:</b> {prop['portal']}
+
+📊 <b>Características:</b>
+   • Habitaciones: {prop['habitaciones']}
+   • Baños: {prop['banos']}
+   • M² Cubiertos: {prop['m2_cubiertos']}
+   • M² Descubiertos: {prop['m2_descubiertos']}
+
+🎯 <b>Amenities:</b> {', '.join(prop['amenities']) if prop['amenities'] else 'No especificados'}
+
+🔗 <a href="{prop['url']}">VER PROPIEDAD</a>
+        """.strip()
+        return mensaje
+''')
+    
+    # Scrapers
+    os.makedirs('scrapers', exist_ok=True)
+    create_file('scrapers/__init__.py', '')
+    create_file('scrapers/zonaprop.py', '''import requests
+from bs4 import BeautifulSoup
+import time
+import re
+
+class ZonaPropScraper:
+    def __init__(self):
+        self.base_url = "https://www.zonaprop.com.ar"
+        self.headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    
+    def search(self):
+        properties = []
+        search_urls = [f"{self.base_url}/casas-venta-saavedra.html", f"{self.base_url}/casas-venta-coghlan.html", f"{self.base_url}/casas-venta-nunez.html", f"{self.base_url}/casas-venta-vicente-lopez.html"]
+        for url in search_urls:
+            try:
+                response = requests.get(url, headers=self.headers, timeout=15)
+                if response.status_code == 200:
+                    properties.extend(self._parse_listings(response.text, url))
+                time.sleep(2)
+            except Exception as e:
+                print(f"Error scraping {url}: {e}")
+        return properties
+    
+    def _parse_listings(self, html, search_url):
+        soup = BeautifulSoup(html, 'html.parser')
+        properties = []
+        listings = soup.find_all('div', {'data-qa': 'posting PROPERTY'})
+        if not listings:
+            listings = soup.find_all('div', class_=re.compile('CardContainer'))
+        for listing in listings[:10]:
+            try:
+                prop = self._parse_property(listing)
+                if prop:
+                    properties.append(prop)
+            except Exception as e:
+                continue
+        return properties
+    
+    def _parse_property(self, listing):
+        try:
+            external_id = listing.get('data-id', listing.get('id', f"zp_{hash(str(listing)[:50])}"))
+            title_elem = listing.find('h2') or listing.find('a')
+            titulo = title_elem.text.strip() if title_elem else "Sin título"
+            link_elem = listing.find('a', href=True)
+            url = link_elem.get('href', '') if link_elem else ''
+            if url and not url.startswith('http'):
+                url = self.base_url + url
+            price_elem = listing.find('div', {'data-qa': 'POSTING_CARD_PRICE'})
+            precio = 0
+            moneda = 'USD'
+            if price_elem:
+                price_text = price_elem.text.strip()
+                numbers = re.findall(r'[\\d\\.]+', price_text.replace('.', '').replace(',', ''))
+                precio = float(numbers[0]) if numbers else 0
+                moneda = 'USD' if 'USD' in price_text or 'U$S' in price_text else 'ARS'
+            ubicacion_elem = listing.find('div', {'data-qa': 'POSTING_CARD_LOCATION'})
+            ubicacion = ubicacion_elem.text.strip() if ubicacion_elem else "No especificada"
+            features = listing.find_all('span', {'data-qa': re.compile('POSTING_CARD_FEATURES')})
+            habitaciones = 0
+            banos = 0
+            m2_cubiertos = 0
+            for feature in features:
+                text = feature.text.lower()
+                if 'dorm' in text or 'hab' in text:
+                    num = re.search(r'\\d+', text)
+                    habitaciones = int(num.group()) if num else 0
+                elif 'baño' in text:
+                    num = re.search(r'\\d+', text)
+                    banos = int(num.group()) if num else 0
+                elif 'm²' in text or 'm2' in text:
+                    num = re.search(r'\\d+', text)
+                    m2_val = float(num.group()) if num else 0
+                    if m2_cubiertos == 0:
+                        m2_cubiertos = m2_val
+            desc_elem = listing.find('div', class_=re.compile('description'))
+            descripcion = desc_elem.text.strip() if desc_elem else titulo
+            amenities = []
+            texto_completo = (titulo + " " + descripcion).lower()
+            if any(word in texto_completo for word in ['garaje', 'cochera']):
+                amenities.append('garaje')
+            if any(word in texto_completo for word in ['piscina', 'pileta']):
+                amenities.append('piscina')
+            if any(word in texto_completo for word in ['jardin', 'jardín']):
+                amenities.append('jardín')
+            img_elem = listing.find('img')
+            imagenes = [img_elem.get('src', '')] if img_elem else []
+            return {'external_id': f"zonaprop_{external_id}", 'portal': 'ZonaProp', 'titulo': titulo, 'precio': precio, 'moneda': moneda, 'ubicacion': ubicacion, 'tipo': 'Casa', 'habitaciones': habitaciones, 'banos': banos, 'm2_cubiertos': m2_cubiertos, 'm2_descubiertos': 0, 'amenities': amenities, 'descripcion': descripcion, 'url': url, 'imagenes': imagenes, 'match_score': 0}
+        except:
+            return None
+''')
+    
+    # Main.py
+    create_file('main.py', '''#!/usr/bin/env python3
+from database import PropertyDatabase
+from matcher import PropertyMatcher
+from notifier import TelegramNotifier
+from scrapers.zonaprop import ZonaPropScraper
+from config import MATCH_THRESHOLD
+import time
+
+def main():
+    print("🏠 Iniciando búsqueda de propiedades...")
+    db = PropertyDatabase()
+    matcher = PropertyMatcher()
+    notifier = TelegramNotifier()
+    scrapers = [ZonaPropScraper()]
+    total_nuevas = 0
+    total_alertas = 0
+    for scraper in scrapers:
+        print(f"\\n🔍 Scrapeando {scraper.__class__.__name__}...")
+        try:
+            properties = scraper.search()
+            print(f"   Encontradas: {len(properties)} propiedades")
+            for prop in properties:
+                prop['match_score'] = matcher.calculate_match(prop)
+                is_new = db.save_property(prop)
+                if is_new:
+                    total_nuevas += 1
+                    print(f"   ✅ Nueva: {prop['titulo'][:50]}... ({prop['match_score']}%)")
+                    if prop['match_score'] >= MATCH_THRESHOLD:
+                        print(f"   🔔 Enviando alerta...")
+                        if notifier.send_property_alert(prop):
+                            db.mark_as_notified(prop['external_id'])
+                            total_alertas += 1
+                time.sleep(1)
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            continue
+    print(f"\\n📊 RESUMEN: {total_nuevas} nuevas | {total_alertas} alertas\\n")
+
+if __name__ == "__main__":
+    main()
+''')
+    
+    # Workflow
+    os.makedirs('.github/workflows', exist_ok=True)
+    create_file('.github/workflows/scraper.yml', '''name: Property Scraper
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    - name: Run scraper
+      env:
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      run: python main.py
+    - name: Commit changes
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add -A
+        git diff --quiet && git diff --staged --quiet || git commit -m "Update [skip ci]"
+        git push
+''')
+    
+    print("✅ ¡Instalación completada!")
+
+if __name__ == "__main__":
+    setup_project()
